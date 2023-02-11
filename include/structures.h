@@ -1,0 +1,204 @@
+//
+// Created by dave on 10.02.23.
+//
+
+#ifndef ESP8266_WIFI_SNIFFER_STRUCTURES_H
+#define ESP8266_WIFI_SNIFFER_STRUCTURES_H
+
+#define ETH_MAC_LEN 6
+
+unsigned char broadcast1[3] = { 0x01, 0x00, 0x5e };
+unsigned char broadcast2[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+unsigned char broadcast3[3] = { 0x33, 0x33, 0x00 };
+
+
+struct BeaconInfo
+{
+  unsigned char bssid[ETH_MAC_LEN];
+  unsigned char ssid[33];
+  int ssid_len;
+  int channel;
+  int err;
+  signed rssi;
+  unsigned char capa[2];
+  long lastDiscoveredTime;
+};
+
+struct ClientInfo
+{
+  unsigned char bssid[ETH_MAC_LEN];
+  unsigned char station[ETH_MAC_LEN];
+  unsigned char ap[ETH_MAC_LEN];
+  int channel;
+  int err;
+  signed rssi;
+  unsigned short  seq_n;
+  long lastDiscoveredTime;
+};
+
+/* ==============================================
+   Promiscous callback structures, see ESP manual
+   ============================================== */
+struct RxControl {
+  signed rssi: 8;
+  unsigned rate: 4;
+  unsigned is_group: 1;
+  unsigned: 1;
+  unsigned sig_mode: 2;
+  unsigned legacy_length: 12;
+  unsigned damatch0: 1;
+  unsigned damatch1: 1;
+  unsigned bssidmatch0: 1;
+  unsigned bssidmatch1: 1;
+  unsigned MCS: 7;
+  unsigned CWB: 1;
+  unsigned HT_length: 16;
+  unsigned Smoothing: 1;
+  unsigned Not_Sounding: 1;
+  unsigned: 1;
+  unsigned Aggregation: 1;
+  unsigned STBC: 2;
+  unsigned FEC_CODING: 1;
+  unsigned SGI: 1;
+  unsigned rxend_state: 8;
+  unsigned ampdu_cnt: 8;
+  unsigned channel: 4;
+  unsigned: 12;
+};
+
+struct LenSeq {
+  unsigned short  length;
+  unsigned short  seq;
+  unsigned char  address3[6];
+};
+
+struct sniffer_buf {
+  struct RxControl rx_ctrl;
+  unsigned char buf[36];
+  unsigned short  cnt;
+  struct LenSeq lenseq[1];
+};
+
+struct SnifferBuffer2 {
+  struct RxControl rx_ctrl;
+  unsigned char buf[112];
+  unsigned short  cnt;
+  unsigned short  len;
+};
+
+struct ClientInfo parse_data(unsigned char *frame, unsigned short  framelen, signed rssi, unsigned channel)
+{
+  struct ClientInfo ci;
+  ci.channel = channel;
+  ci.err = 0;
+  ci.rssi = rssi;
+  unsigned char *bssid;
+  unsigned char *station;
+  unsigned char *ap;
+  unsigned char ds;
+
+  ds = frame[1] & 3;    //Set first 6 bits to 0
+  switch (ds) {
+    // p[1] - xxxx xx00 => NoDS   p[4]-DST p[10]-SRC p[16]-BSS
+    case 0:
+      bssid = frame + 16;
+      station = frame + 10;
+      ap = frame + 4;
+      break;
+      // p[1] - xxxx xx01 => ToDS   p[4]-BSS p[10]-SRC p[16]-DST
+    case 1:
+      bssid = frame + 4;
+      station = frame + 10;
+      ap = frame + 16;
+      break;
+      // p[1] - xxxx xx10 => FromDS p[4]-DST p[10]-BSS p[16]-SRC
+    case 2:
+      bssid = frame + 10;
+      // hack - don't know why it works like this...
+      if (memcmp(frame + 4, broadcast1, 3) != 0 || memcmp(frame + 4, broadcast2, 3) != 0 || memcmp(frame + 4, broadcast3, 3) != 0) {
+        station = frame + 16;
+        ap = frame + 4;
+      } else {
+        station = frame + 4;
+        ap = frame + 16;
+      }
+      break;
+      // p[1] - xxxx xx11 => WDS    p[4]-RCV p[10]-TRM p[16]-DST p[26]-SRC
+    case 3:
+      bssid = frame + 10;
+      station = frame + 4;
+      ap = frame + 4;
+      break;
+  }
+
+  memcpy(ci.station, station, ETH_MAC_LEN);
+  memcpy(ci.bssid, bssid, ETH_MAC_LEN);
+  memcpy(ci.ap, ap, ETH_MAC_LEN);
+
+  ci.seq_n = frame[23] * 0xFF + (frame[22] & 0xF0);
+  return ci;
+}
+
+struct ClientInfo parse_probe(unsigned char *frame, unsigned short  framelen, signed rssi)
+{
+  struct ClientInfo pi;
+  pi.channel = -1;
+  pi.err = 0;
+  pi.rssi = rssi;
+  memset(pi.bssid,0xFF,ETH_MAC_LEN);
+  memcpy(pi.station, frame + 10, ETH_MAC_LEN);
+  if ((pi.station[0] & 2) == 2) pi.channel=-2; // Randomised MAC !
+  return pi;
+}
+
+struct BeaconInfo parse_beacon(unsigned char *frame, unsigned short  framelen, signed rssi)
+{
+  struct BeaconInfo bi;
+  bi.ssid_len = 0;
+  bi.channel = 0;
+  bi.err = 0;
+  bi.rssi = rssi;
+  int pos = 36;
+
+  if (frame[pos] == 0x00) {
+    while (pos < framelen) {
+      switch (frame[pos]) {
+        case 0x00: //SSID
+          bi.ssid_len = (int) frame[pos + 1];
+          if (bi.ssid_len == 0) {
+            memset(bi.ssid, '\x00', 33);
+            break;
+          }
+          if (bi.ssid_len < 0) {
+            bi.err = -1;
+            break;
+          }
+          if (bi.ssid_len > 32) {
+            bi.err = -2;
+            break;
+          }
+          memset(bi.ssid, '\x00', 33);
+          memcpy(bi.ssid, frame + pos + 2, bi.ssid_len);
+          bi.err = 0;  // before was error??
+          break;
+        case 0x03: //Channel
+          bi.channel = (int) frame[pos + 2];
+          pos = -1;
+          break;
+        default:
+          break;
+      }
+      if (pos < 0) break;
+      pos += (int) frame[pos + 1] + 2;
+    }
+  } else {
+    bi.err = -3;
+  }
+
+  bi.capa[0] = frame[34];
+  bi.capa[1] = frame[35];
+  memcpy(bi.bssid, frame + 10, ETH_MAC_LEN);
+  return bi;
+}
+
+#endif //ESP8266_WIFI_SNIFFER_STRUCTURES_H
